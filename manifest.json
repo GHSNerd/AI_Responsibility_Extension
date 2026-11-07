@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "AI Emissions Tracker",
+  "version": "1.0",
+  "permissions": ["storage", "scripting"],
+  "optional_host_permissions": [
+    "https://claude.ai/*",
+    "https://chatgpt.com/*",
+    "https://gemini.google.com/*"
+  ],
+  "action": { "default_popup": "popup.html" },
+  "background": { "service_worker": "background.js" }
+}
