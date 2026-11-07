@@ -27,30 +27,38 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
   record(host, msg);
 });
 
-async function record(host, { convKey, userChars, assistantChars }) {
+async function record(host, { convKey, userChars, assistantChars, initial }) {
   const key = `${host}${convKey}`;
 
-  // Memory-only baseline (cleared when the browser closes): last totals seen per conversation
   const { baselines = {} } = await chrome.storage.session.get("baselines");
-  const prev = baselines[key] || { u: 0, a: 0 };
-  const dU = Math.max(0, userChars - prev.u);
-  const dA = Math.max(0, assistantChars - prev.a);
-  baselines[key] = { u: Math.max(prev.u, userChars), a: Math.max(prev.a, assistantChars) };
+  const prev = baselines[key];
+
+  if (!prev) {
+    baselines[key] = { u: userChars, a: assistantChars };
+    await chrome.storage.session.set({ baselines });
+    if (initial) return;
+  }
+
+  const base = prev || { u: 0, a: 0 };
+  const dU = Math.max(0, userChars - base.u);
+  const dA = Math.max(0, assistantChars - base.a);
+  baselines[key] = {
+    u: Math.max(base.u, userChars),
+    a: Math.max(base.a, assistantChars),
+  };
   await chrome.storage.session.set({ baselines });
 
   if (!dU && !dA) return;
 
-  const inTok = dU / CHARS_PER_TOKEN;
-  const outTok = dA / CHARS_PER_TOKEN;
-  const wh = (inTok / 1000) * WH_PER_1K_INPUT_TOKENS + (outTok / 1000) * WH_PER_1K_OUTPUT_TOKENS;
-  const g = (wh / 1000) * GRID_G_CO2_PER_KWH;
+  const { tokens, gCO2 } = estimate(dU, dA);   // replaces the whole block
 
   const day = new Date().toISOString().slice(0, 10);
   const { totals = {} } = await chrome.storage.local.get("totals");
   const id = `${day}|${host}`;
   const t = totals[id] || { tokens: 0, gCO2: 0 };
-  t.tokens += Math.round(inTok + outTok);
-  t.gCO2 += g;
+  t.tokens += tokens;   // was: Math.round(inTok + outTok)
+  t.gCO2 += gCO2;       // was: g
   totals[id] = t;
   await chrome.storage.local.set({ totals });
+  await updateBadge(totals);
 }

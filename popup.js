@@ -49,11 +49,7 @@ async function syncContentScripts() {
   }
 }
 
-// Keep these in sync with background.js
-const CHARS_PER_TOKEN = 4;
-const WH_PER_1K_OUTPUT_TOKENS = 0.3;
-const WH_PER_1K_INPUT_TOKENS = 0.1;
-const GRID_G_CO2_PER_KWH = 400;
+import { estimate } from "./constants.js";
 
 // Returns { source, days: { "YYYY-MM-DD": { u, a } } } using character counts only
 function parseExport(data) {
@@ -113,13 +109,9 @@ document.getElementById("import").onchange = async (e) => {
 
     let tokens = 0;
     for (const [day, { u, a }] of Object.entries(parsed.days)) {
-      const inTok = u / CHARS_PER_TOKEN, outTok = a / CHARS_PER_TOKEN;
-      const wh = (inTok / 1000) * WH_PER_1K_INPUT_TOKENS + (outTok / 1000) * WH_PER_1K_OUTPUT_TOKENS;
-      totals[`${day}${suffix}`] = {
-        tokens: Math.round(inTok + outTok),
-        gCO2: (wh / 1000) * GRID_G_CO2_PER_KWH,
-      };
-      tokens += Math.round(inTok + outTok);
+        const { tokens: tk, gCO2 } = estimate(u, a);
+        totals[`${day}${suffix}`] = { tokens: tk, gCO2 };
+        tokens += tk;
     }
     await chrome.storage.local.set({ totals });
     status.textContent = `Imported ${Object.keys(parsed.days).length} days (~${tokens.toLocaleString()} tokens).`;
