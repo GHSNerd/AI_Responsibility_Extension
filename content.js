@@ -1,6 +1,8 @@
 // Candidate selectors per site, ordered from most to least stable.
 // The first one that matches any elements wins.
 // Prefer data-*, aria-*, role, and custom tag names over class names.
+console.log("[tracker] content script loaded on", location.hostname);
+
 const CANDIDATES = {
   "claude.ai": [
     { sel: "[data-message-role]", role: (n) => n.getAttribute("data-message-role") },
