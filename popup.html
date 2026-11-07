@@ -3,7 +3,16 @@
   <h3>AI Emissions Tracker</h3>
   <div id="sites"></div>
   <hr>
-  <div id="totals">No data yet.</div>
+  <div id="today">Today: no data yet.</div>
+  <div id="totals">All time: no data yet.</div>
+
+  <label style="display:block;margin-top:8px;font-size:12px">
+    Import past history (conversations.json from your data export):
+    <input type="file" id="import" accept=".json" style="width:100%">
+  </label>
+  <div id="importStatus" style="font-size:11px;color:#666"></div>
+
+  <button id="clear" style="margin-top:8px;width:100%">Clear stored totals</button>
   <p style="font-size:11px;color:#666">
     Chat text is read in your browser, counted, and discarded. Only totals are kept.
   </p>
