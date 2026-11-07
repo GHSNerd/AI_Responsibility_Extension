@@ -1,6 +1,4 @@
-// Candidate selectors per site, ordered from most to least stable.
-// The first one that matches any elements wins.
-// Prefer data-*, aria-*, role, and custom tag names over class names.
+
 console.log("[tracker] content script loaded on", location.hostname);
 
 const CANDIDATES = {
@@ -20,8 +18,7 @@ const CANDIDATES = {
   ],
 };
 
-// Returns { msgs, mode } where mode is "selectors" or "fallback".
-// Only lengths are returned, never text.
+// Returns { mode, msgs } where each msg has { node, role, len }. Text is never kept.
 function readMessages() {
   for (const c of CANDIDATES[location.hostname] || []) {
     const nodes = document.querySelectorAll(c.sel);
@@ -29,66 +26,102 @@ function readMessages() {
       return {
         mode: "selectors",
         msgs: [...nodes].map((n) => ({
+          node: n,
           role: c.role(n) === "user" ? "user" : "assistant",
           len: n.textContent.length,
         })),
       };
     }
   }
-  // Selector-free fallback: treat all text in <main> as output.
-  // Less accurate (can't separate user from AI), but survives redesigns.
   const root = document.querySelector("main") || document.body;
-  return { mode: "fallback", msgs: [{ role: "assistant", len: root.textContent.length }] };
+  return { mode: "fallback", msgs: [{ node: root, role: "assistant", len: root.textContent.length }] };
 }
 
 (() => {
-  if (window.__emissionsTrackerLoaded) return; // avoid double injection
+  if (window.__emissionsTrackerLoaded) return;
   window.__emissionsTrackerLoaded = true;
-
   if (!CANDIDATES[location.hostname]) return;
 
   const THROTTLE_MS = 1000;
-  let lastRun = 0;
-  let pending = null;
+  const SETTLE_MS = 2000;     // after load/navigation, everything is baseline
+  const MAX_JUMP = 6000;      // fallback mode: ignore implausible one-second jumps
+
+  let known = new WeakMap();  // node -> highest length seen
+  let lastNode = null;        // last message node from the previous pass
   let lastPath = location.pathname;
   let lastMode = null;
-  let nextIsInitial = true; // first report on a page/conversation/mode is a baseline only
+  let settleUntil = Date.now() + 1500;
+  let lastRun = 0;
+  let pending = null;
+
+  function reset() {
+    known = new WeakMap();
+    lastNode = null;
+    settleUntil = Date.now() + SETTLE_MS;
+  }
 
   function report() {
     lastRun = Date.now();
 
     if (location.pathname !== lastPath) {
       lastPath = location.pathname;
-      nextIsInitial = true; // SPA navigation to another conversation
+      reset();
     }
 
     const { msgs, mode } = readMessages();
     if (mode !== lastMode) {
       lastMode = mode;
-      nextIsInitial = true; // switching modes changes what's measured, so re-baseline
+      reset();
     }
 
-    const sum = (role) =>
-      msgs.filter((m) => m.role === role).reduce((a, m) => a + m.len, 0);
+    const baselining = Date.now() < settleUntil;
+    const lastInList = msgs.length ? msgs[msgs.length - 1].node : null;
+    let dU = 0, dA = 0;
 
-    try {
-      chrome.runtime.sendMessage({
-        type: "usage",
-        // Mode is part of the key so selector and fallback baselines never mix
-        convKey: `${location.pathname}#${mode}`,
-        userChars: sum("user"),
-        assistantChars: sum("assistant"),
-        initial: nextIsInitial,
-        fallback: mode === "fallback",
-      });
-    } catch {
-      return; // extension was reloaded or updated; this script is orphaned
+    const count = (role, n) => {
+      if (mode === "fallback" && n > MAX_JUMP) return; // likely a layout change, not streaming
+      if (role === "user") dU += n;
+      else dA += n;
+    };
+
+    for (const m of msgs) {
+      const prev = known.get(m.node);
+
+      if (prev === undefined) {
+        // First time seeing this message
+        known.set(m.node, m.len);
+        const isAppended =
+          lastNode && lastNode.isConnected
+            ? !!(lastNode.compareDocumentPosition(m.node) & Node.DOCUMENT_POSITION_FOLLOWING)
+            : false;
+        // Only count messages added after the last known one (a new turn).
+        // Older messages loaded above (lazy history) are baseline only.
+        if (!baselining && isAppended) count(m.role, m.len);
+        continue;
+      }
+
+      if (m.len > prev) {
+        known.set(m.node, m.len);
+        if (!baselining) count(m.role, m.len - prev); // streaming growth
+      }
     }
-    nextIsInitial = false;
+
+    if (lastInList) lastNode = lastInList;
+
+    if (dU || dA) {
+      try {
+        chrome.runtime.sendMessage({
+          type: "usage",
+          userChars: dU,        // deltas, not totals
+          assistantChars: dA,
+          fallback: mode === "fallback",
+        });
+      } catch {
+        // extension reloaded; this script is orphaned
+      }
+    }
   }
 
-  // Throttle: run immediately if idle, otherwise at most once per THROTTLE_MS,
-  // always finishing with a trailing run so the final text is captured.
   function schedule() {
     if (pending) return;
     const wait = Math.max(0, THROTTLE_MS - (Date.now() - lastRun));
@@ -104,6 +137,5 @@ function readMessages() {
     characterData: true,
   });
 
-  // Let the page finish loading history before taking the baseline
   setTimeout(report, 1500);
 })();

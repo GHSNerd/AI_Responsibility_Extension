@@ -27,37 +27,17 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
   record(host, msg);
 });
 
-async function record(host, { convKey, userChars, assistantChars, initial }) {
-  const key = `${host}${convKey}`;
+async function record(host, { userChars, assistantChars }) {
+  if (!userChars && !assistantChars) return;
 
-  const { baselines = {} } = await chrome.storage.session.get("baselines");
-  const prev = baselines[key];
-
-  if (!prev) {
-    baselines[key] = { u: userChars, a: assistantChars };
-    await chrome.storage.session.set({ baselines });
-    if (initial) return;
-  }
-
-  const base = prev || { u: 0, a: 0 };
-  const dU = Math.max(0, userChars - base.u);
-  const dA = Math.max(0, assistantChars - base.a);
-  baselines[key] = {
-    u: Math.max(base.u, userChars),
-    a: Math.max(base.a, assistantChars),
-  };
-  await chrome.storage.session.set({ baselines });
-
-  if (!dU && !dA) return;
-
-  const { tokens, gCO2 } = estimate(dU, dA);   // replaces the whole block
+  const { tokens, gCO2 } = estimate(userChars, assistantChars);
 
   const day = new Date().toISOString().slice(0, 10);
   const { totals = {} } = await chrome.storage.local.get("totals");
   const id = `${day}|${host}`;
   const t = totals[id] || { tokens: 0, gCO2: 0 };
-  t.tokens += tokens;   // was: Math.round(inTok + outTok)
-  t.gCO2 += gCO2;       // was: g
+  t.tokens += tokens;
+  t.gCO2 += gCO2;
   totals[id] = t;
   await chrome.storage.local.set({ totals });
   await updateBadge(totals);
