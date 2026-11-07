@@ -1,11 +1,50 @@
+import { estimate } from "./constants.js";
+
 const SITES = {
   "claude.ai": "https://claude.ai/*",
   "chatgpt.com": "https://chatgpt.com/*",
   "gemini.google.com": "https://gemini.google.com/*",
 };
+const SCRIPT_ID = "tracker";
+
+/* ---------- Permissions + content script registration ---------- */
+
+async function grantedOrigins() {
+  const { origins = [] } = await chrome.permissions.getAll();
+  const known = Object.values(SITES);
+  return origins.filter((o) => known.includes(o));
+}
+
+// One registered script whose matches = every site the user has granted.
+// Re-run whenever permissions change (including revocations done outside the popup).
+async function syncContentScripts() {
+  const granted = await grantedOrigins();
+  try { await chrome.scripting.unregisterContentScripts({ ids: [SCRIPT_ID] }); } catch {}
+  if (granted.length) {
+    await chrome.scripting.registerContentScripts([{
+      id: SCRIPT_ID,
+      matches: granted,
+      js: ["content.js"],
+      runAt: "document_idle",
+      persistAcrossSessions: true,
+    }]);
+  }
+}
+
+// Registration only affects pages loaded later, so inject into tabs already open.
+async function injectIntoOpenTabs(origin) {
+  const tabs = await chrome.tabs.query({ url: origin });
+  for (const tab of tabs) {
+    chrome.scripting
+      .executeScript({ target: { tabId: tab.id }, files: ["content.js"] })
+      .catch(console.error);
+  }
+}
+
+/* ---------- UI ---------- */
 
 async function render() {
-  const granted = (await chrome.permissions.getAll()).origins || [];
+  const granted = await grantedOrigins();
   const box = document.getElementById("sites");
   box.innerHTML = "";
 
@@ -15,10 +54,22 @@ async function render() {
     btn.textContent = `${on ? "Stop tracking" : "Track"} ${name}`;
     btn.style.cssText = "display:block;width:100%;margin:4px 0";
     btn.onclick = async () => {
-      // Must run inside a click (user gesture)
-      if (on) await chrome.permissions.remove({ origins: [origin] });
-      else if (!(await chrome.permissions.request({ origins: [origin] }))) return;
-      await syncContentScripts();
+      btn.disabled = true;
+      try {
+        if (on) {
+          await chrome.permissions.remove({ origins: [origin] });
+          await syncContentScripts();
+        } else {
+          // request() must be the first await so it stays tied to the click
+          const ok = await chrome.permissions.request({ origins: [origin] });
+          if (ok) {
+            await syncContentScripts();
+            await injectIntoOpenTabs(origin);
+          }
+        }
+      } catch (err) {
+        console.error(err);
+      }
       render();
     };
     box.appendChild(btn);
@@ -26,30 +77,15 @@ async function render() {
 
   const { totals = {} } = await chrome.storage.local.get("totals");
   const sum = Object.values(totals).reduce(
-    (a, d) => ({ g: a.g + d.gCO2, t: a.t + d.tokens }),
+    (a, d) => ({ g: a.g + (d.gCO2 || 0), t: a.t + (d.tokens || 0) }),
     { g: 0, t: 0 }
   );
-  if (sum.t) {
-    document.getElementById("totals").textContent =
-      `~${sum.t.toLocaleString()} tokens ≈ ${sum.g.toFixed(1)} g CO₂e (rough estimate)`;
-  }
+  document.getElementById("totals").textContent = sum.t
+    ? `~${sum.t.toLocaleString()} tokens ≈ ${sum.g.toFixed(1)} g CO₂e (rough estimate)`
+    : "No usage recorded yet.";
 }
 
-async function syncContentScripts() {
-  const granted = (await chrome.permissions.getAll()).origins || [];
-  try { await chrome.scripting.unregisterContentScripts({ ids: ["tracker"] }); } catch {}
-  if (granted.length) {
-    await chrome.scripting.registerContentScripts([{
-      id: "tracker",
-      matches: granted,
-      js: ["content.js"],
-      runAt: "document_idle",
-      persistAcrossSessions: true,
-    }]);
-  }
-}
-
-import { estimate } from "./constants.js";
+/* ---------- Export import ---------- */
 
 // Returns { source, days: { "YYYY-MM-DD": { u, a } } } using character counts only
 function parseExport(data) {
@@ -67,7 +103,13 @@ function parseExport(data) {
       for (const m of c.chat_messages) {
         const role = m.sender === "human" ? "user" : "assistant";
         const day = (m.created_at || c.created_at || "").slice(0, 10);
-        add(day, role, (m.text || "").length);
+        // Fall back to content blocks if a message has no top-level text
+        const text =
+          m.text ||
+          (Array.isArray(m.content)
+            ? m.content.map((b) => b.text || "").join("")
+            : "");
+        add(day, role, text.length);
       }
     }
     return { source: "claude", days };
@@ -109,16 +151,20 @@ document.getElementById("import").onchange = async (e) => {
 
     let tokens = 0;
     for (const [day, { u, a }] of Object.entries(parsed.days)) {
-        const { tokens: tk, gCO2 } = estimate(u, a);
-        totals[`${day}${suffix}`] = { tokens: tk, gCO2 };
-        tokens += tk;
+      const { tokens: tk, gCO2 } = estimate(u, a);
+      totals[`${day}${suffix}`] = { tokens: tk, gCO2 };
+      tokens += tk;
     }
     await chrome.storage.local.set({ totals });
     status.textContent = `Imported ${Object.keys(parsed.days).length} days (~${tokens.toLocaleString()} tokens).`;
+    render(); // refresh the totals line
   } catch {
     status.textContent = "Couldn't read that file.";
   }
   e.target.value = "";
 };
 
-render();
+/* ---------- Startup ---------- */
+
+// Reconcile registration with current permissions (handles revocation from chrome://extensions)
+syncContentScripts().catch(console.error).finally(render);
