@@ -9,6 +9,17 @@
     "https://chatgpt.com/*",
     "https://gemini.google.com/*"
   ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://claude.ai/*",
+        "https://chatgpt.com/*",
+        "https://gemini.google.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
   "action": { "default_popup": "popup.html" },
   "background": { "service_worker": "background.js", "type": "module" }
 }
