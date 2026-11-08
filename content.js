@@ -1,141 +1,305 @@
+// content.js: runs inside AI chat websites (see SITES below).
+// Notices each message YOU send, waits for the AI's reply to finish, then
+// sends one event to background.js. Nothing leaves your computer.
 
-console.log("[tracker] content script loaded on", location.hostname);
+(() => {
+  // Note: "Load data" re-adds this script only to tabs where it isn't responding
+  // (e.g. after the extension was reloaded), so it doesn't need a run-once guard.
 
-const CANDIDATES = {
-  "claude.ai": [
-    { sel: "[data-message-role]", role: (n) => n.getAttribute("data-message-role") },
-    { sel: "[data-testid*='message']", role: (n) => (n.matches("[data-testid*='user']") ? "user" : "assistant") },
-  ],
-  "chatgpt.com": [
-    { sel: "[data-message-author-role]", role: (n) => n.getAttribute("data-message-author-role") },
-    {
-      sel: "article[data-testid^='conversation-turn']",
-      role: (n) => (n.querySelector("[data-message-author-role='user']") ? "user" : "assistant"),
+  // Website → AI name used in the data. Keep in sync with lib/constants.js and manifest.json.
+  const SITES = {
+    "chatgpt.com": "chatgpt",
+    "chat.openai.com": "chatgpt",
+    "claude.ai": "claude",
+    "gemini.google.com": "gemini",
+    "www.perplexity.ai": "perplexity",
+    "copilot.microsoft.com": "copilot",
+    "chat.deepseek.com": "deepseek",
+    "grok.com": "grok",
+    "chat.mistral.ai": "mistral",
+  };
+  const SITE = SITES[location.hostname];
+  if (!SITE) return;
+
+  // Where some sites put user messages and AI replies, which lets us measure
+  // reply length and power "Load data". These sites change their HTML often.
+  // If tracking stops working, open DevTools (F12), inspect a message, and
+  // update these selectors. Sites not listed here are still tracked: each
+  // prompt is counted when you press send, with a typical reply length.
+  const SELECTORS = {
+    chatgpt: {
+      user: '[data-message-author-role="user"]',
+      assistant: '[data-message-author-role="assistant"]',
     },
-  ],
-  "gemini.google.com": [
-    { sel: "user-query, model-response", role: (n) => (n.tagName.toLowerCase() === "user-query" ? "user" : "assistant") },
-  ],
-};
+    claude: {
+      user: '[data-testid="user-message"]',
+      assistant: ".font-claude-response, .font-claude-message, [data-is-streaming]",
+    },
+    gemini: {
+      user: "user-query",
+      assistant: "model-response",
+    },
+  };
+  const sel = SELECTORS[SITE] ?? null;
 
-// Returns { mode, msgs } where each msg has { node, role, len }. Text is never kept.
-function readMessages() {
-  for (const c of CANDIDATES[location.hostname] || []) {
-    const nodes = document.querySelectorAll(c.sel);
-    if (nodes.length) {
-      return {
-        mode: "selectors",
-        msgs: [...nodes].map((n) => ({
-          node: n,
-          role: c.role(n) === "user" ? "user" : "assistant",
-          len: n.textContent.length,
-        })),
+  const SEND_WINDOW_MS = 15000; // a sent message must appear within 15 s of pressing send
+  const STABLE_MS = 2500; // reply counts as finished after this long unchanged
+  const TIMEOUT_MS = 120000; // give up waiting for a reply after 2 minutes
+
+  const seen = new WeakSet();
+  let pending = null; // the prompt we're waiting on a reply for
+
+  // ---------- Noticing when you send a message ----------
+  // Only messages YOU send count. Messages that appear because you opened an
+  // old conversation aren't preceded by a send, so they're ignored. (Watching
+  // for a send works even when a new chat changes the page address.)
+  let sendsWaiting = 0;
+  let lastSendAt = 0;
+  let lastSendText = "";
+
+  // The chat box: a multi-line text area or rich-text editor, not a small
+  // search or rename field.
+  const isTextBox = (t) =>
+    t instanceof Element &&
+    (t.matches("textarea") || t.isContentEditable) &&
+    (t.closest("textarea, [contenteditable=true]") ?? t).getBoundingClientRect().width > 200;
+
+  function composerNear(el) {
+    if (isTextBox(document.activeElement)) return document.activeElement;
+    for (let node = el; node; node = node.parentElement) {
+      const box = [...node.querySelectorAll("textarea, [contenteditable=true]")].find(isTextBox);
+      if (box) return box;
+    }
+    return null;
+  }
+
+  const boxText = (box) => ((box?.value ?? box?.innerText ?? "") || "").trim();
+
+  function noteSend(text) {
+    if (!text) return; // nothing typed: not a real send
+    // Enter, the send button and the form's submit can all fire for one send.
+    if (Date.now() - lastSendAt < 1000 && text === lastSendText) return;
+    lastSendAt = Date.now();
+    lastSendText = text;
+    if (!sel) {
+      // A site without known selectors: count it now with a typical reply length.
+      send({ site: SITE, promptText: text, responseChars: 0 });
+      return;
+    }
+    sendsWaiting = Math.min(sendsWaiting + 1, 3);
+  }
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && isTextBox(e.target)) {
+      noteSend(boxText(e.target.closest("textarea, [contenteditable=true]") ?? e.target));
+    }
+  }, true);
+
+  document.addEventListener("click", (e) => {
+    const btn = e.target instanceof Element && e.target.closest("button, [role=button]");
+    if (!btn) return;
+    const label = `${btn.getAttribute("aria-label") ?? ""} ${btn.getAttribute("data-testid") ?? ""} ${btn.className}`;
+    if (/send|submit/i.test(label)) noteSend(boxText(composerNear(btn)));
+  }, true);
+
+  document.addEventListener("submit", (e) => noteSend(boxText(composerNear(e.target))), true);
+
+  // If the site's layout changed and your message never showed up where we
+  // look for it, still count the prompt (with a typical reply length).
+  function expireSends() {
+    if (!sendsWaiting || Date.now() - lastSendAt <= SEND_WINDOW_MS) return;
+    sendsWaiting = 0;
+    send({ site: SITE, promptText: lastSendText, responseChars: 0 });
+  }
+
+  const textOf = (el) => (el?.innerText || el?.textContent || "").trim();
+
+  // A short fingerprint of a message, so the same prompt is never counted
+  // twice (by live tracking and by "Load data"). The text itself isn't stored.
+  function hashText(text) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193);
+    return (h >>> 0).toString(36);
+  }
+
+  function keyFor(userEl) {
+    const hash = hashText(textOf(userEl));
+    let occurrence = 0;
+    for (const el of document.querySelectorAll(sel.user)) {
+      if (el === userEl) break;
+      if (hashText(textOf(el)) === hash) occurrence++;
+    }
+    return `${SITE}:${location.pathname}:${hash}:${occurrence}`;
+  }
+
+  function send(event) {
+    try {
+      chrome.runtime.sendMessage({ type: "ai-event", ...event });
+    } catch (e) {
+      // Happens after the extension is reloaded; refresh the page to fix.
+      console.debug("[Evergreen] could not send event:", e);
+    }
+  }
+
+  // ---------- Generated images ----------
+  // A generated image is a large picture inside the AI's reply (icons,
+  // avatars and buttons are small). Images can take a minute or more to
+  // appear, so each finished reply is watched for a while longer and the
+  // prompt is updated if an image shows up.
+  const IMAGE_MIN_PX = 120;
+  const IMAGE_WATCH_MS = 180000;
+  const imageWatch = []; // { replyEl, importKey, images, until }
+
+  function countImages(root) {
+    if (!root?.isConnected) return 0;
+    return [...root.querySelectorAll("img, canvas")].filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width >= IMAGE_MIN_PX && r.height >= IMAGE_MIN_PX;
+    }).length;
+  }
+
+  function watchImages() {
+    const now = Date.now();
+    for (let i = imageWatch.length - 1; i >= 0; i--) {
+      const w = imageWatch[i];
+      const n = countImages(w.replyEl);
+      if (n > w.images) {
+        w.images = n;
+        try {
+          chrome.runtime.sendMessage({ type: "ai-images", site: SITE, importKey: w.importKey, images: n });
+        } catch {
+          /* extension reloaded */
+        }
+      }
+      if (now > w.until || !w.replyEl.isConnected) imageWatch.splice(i, 1);
+    }
+  }
+
+  function finishPending() {
+    if (!pending) return;
+    const importKey = pending.userEl.isConnected ? keyFor(pending.userEl) : undefined;
+    const images = countImages(pending.replyEl);
+    send({
+      site: SITE,
+      promptText: pending.promptText,
+      responseChars: Math.max(pending.lastLen, 0),
+      images,
+      // Made when the reply finishes, after a new chat gets its final URL.
+      importKey,
+    });
+    if (importKey && pending.replyEl) imageWatch.push({ replyEl: pending.replyEl, importKey, images, until: Date.now() + IMAGE_WATCH_MS });
+    pending = null;
+  }
+
+  // "Load data" button: list every prompt visible on this page with its reply
+  // length. background.js skips the ones already counted.
+  function scanPage() {
+    if (!sel) return []; // this site's layout isn't mapped yet
+    const items = [];
+    let current = null;
+    for (const el of document.querySelectorAll(`${sel.user}, ${sel.assistant}`)) {
+      if (el.matches(sel.user)) {
+        current = null;
+        if (pending && el === pending.userEl) continue; // still being answered
+        const text = textOf(el);
+        if (!text) continue;
+        current = { site: SITE, promptText: text, responseChars: 0, images: 0, timestamp: Date.now(), importKey: keyFor(el), gotReply: false };
+        items.push(current);
+      } else if (current && !current.gotReply) {
+        current.responseChars = textOf(el).length; // first reply after the prompt
+        current.images = countImages(el);
+        current.gotReply = true;
+      }
+    }
+    return items.map(({ gotReply, ...item }) => item);
+  }
+
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg?.type === "scan-page") sendResponse({ items: scanPage() });
+    else if (msg?.type === "ping") sendResponse({ ok: true });
+  });
+
+  function scanForNewPrompts() {
+    if (!sel) return;
+    expireSends();
+
+    for (const el of document.querySelectorAll(sel.user)) {
+      if (seen.has(el)) continue;
+      const text = textOf(el);
+      if (!text) continue; // not rendered yet; check again next scan
+      seen.add(el);
+
+      // Same prompt re-drawn by the site (e.g. when a new chat gets its
+      // address): follow the new copy instead of counting it again.
+      if (pending && !pending.userEl.isConnected && text === pending.promptText) {
+        pending.userEl = el;
+        continue;
+      }
+      if (!sendsWaiting) continue; // loaded with an old conversation
+      sendsWaiting--;
+
+      finishPending(); // previous prompt is done if a new one was sent
+      pending = {
+        promptText: text,
+        userEl: el,
+        startedAt: Date.now(),
+        lastLen: -1,
+        stableSince: Date.now(),
       };
     }
   }
-  const root = document.querySelector("main") || document.body;
-  return { mode: "fallback", msgs: [{ node: root, role: "assistant", len: root.textContent.length }] };
-}
 
-(() => {
-  if (window.__emissionsTrackerLoaded) return;
-  window.__emissionsTrackerLoaded = true;
-  if (!CANDIDATES[location.hostname]) return;
-
-  const THROTTLE_MS = 1000;
-  const SETTLE_MS = 2000;     // after load/navigation, everything is baseline
-  const MAX_JUMP = 6000;      // fallback mode: ignore implausible one-second jumps
-
-  let known = new WeakMap();  // node -> highest length seen
-  let lastNode = null;        // last message node from the previous pass
-  let lastPath = location.pathname;
-  let lastMode = null;
-  let settleUntil = Date.now() + 1500;
-  let lastRun = 0;
-  let pending = null;
-
-  function reset() {
-    known = new WeakMap();
-    lastNode = null;
-    settleUntil = Date.now() + SETTLE_MS;
-  }
-
-  function report() {
-    lastRun = Date.now();
-
-    if (location.pathname !== lastPath) {
-      lastPath = location.pathname;
-      reset();
-    }
-
-    const { msgs, mode } = readMessages();
-    if (mode !== lastMode) {
-      lastMode = mode;
-      reset();
-    }
-
-    const baselining = Date.now() < settleUntil;
-    const lastInList = msgs.length ? msgs[msgs.length - 1].node : null;
-    let dU = 0, dA = 0;
-
-    const count = (role, n) => {
-      if (mode === "fallback" && n > MAX_JUMP) return; // likely a layout change, not streaming
-      if (role === "user") dU += n;
-      else dA += n;
-    };
-
-    for (const m of msgs) {
-      const prev = known.get(m.node);
-
-      if (prev === undefined) {
-        // First time seeing this message
-        known.set(m.node, m.len);
-        const isAppended =
-          lastNode && lastNode.isConnected
-            ? !!(lastNode.compareDocumentPosition(m.node) & Node.DOCUMENT_POSITION_FOLLOWING)
-            : false;
-        // Only count messages added after the last known one (a new turn).
-        // Older messages loaded above (lazy history) are baseline only.
-        if (!baselining && isAppended) count(m.role, m.len);
-        continue;
-      }
-
-      if (m.len > prev) {
-        known.set(m.node, m.len);
-        if (!baselining) count(m.role, m.len - prev); // streaming growth
+  function checkReply() {
+    if (!pending || !sel) return;
+    if (!pending.userEl.isConnected) {
+      // The site re-drew the chat; find our prompt again by its text.
+      const again = [...document.querySelectorAll(sel.user)].reverse().find((u) => textOf(u) === pending.promptText);
+      if (again) {
+        seen.add(again);
+        pending.userEl = again;
       }
     }
+    const replies = document.querySelectorAll(sel.assistant);
+    const lastReply = replies[replies.length - 1];
+    const now = Date.now();
 
-    if (lastInList) lastNode = lastInList;
+    // Only a reply that appears AFTER our prompt on the page belongs to it.
+    const isAfterPrompt =
+      lastReply &&
+      pending.userEl.compareDocumentPosition(lastReply) & Node.DOCUMENT_POSITION_FOLLOWING;
 
-    if (dU || dA) {
-      try {
-        chrome.runtime.sendMessage({
-          type: "usage",
-          userChars: dU,        // deltas, not totals
-          assistantChars: dA,
-          fallback: mode === "fallback",
-        });
-      } catch {
-        // extension reloaded; this script is orphaned
+    if (isAfterPrompt) {
+      pending.replyEl = lastReply;
+      const len = textOf(lastReply).length;
+      const imgs = countImages(lastReply);
+      // A reply counts as finished once its text and images stop changing;
+      // an image-only reply (no text) finishes too.
+      if (len !== pending.lastLen || imgs !== pending.lastImgs) {
+        pending.lastLen = len;
+        pending.lastImgs = imgs;
+        pending.stableSince = now;
+      } else if ((len > 0 || imgs > 0) && now - pending.stableSince >= STABLE_MS) {
+        finishPending();
+        return;
       }
     }
+    if (pending && now - pending.startedAt > TIMEOUT_MS) finishPending();
   }
 
-  function schedule() {
-    if (pending) return;
-    const wait = Math.max(0, THROTTLE_MS - (Date.now() - lastRun));
-    pending = setTimeout(() => {
-      pending = null;
-      report();
-    }, wait);
-  }
+  let scanTimer = null;
+  new MutationObserver(() => {
+    clearTimeout(scanTimer);
+    scanTimer = setTimeout(scanForNewPrompts, 300);
+  }).observe(document.documentElement, { childList: true, subtree: true });
 
-  new MutationObserver(schedule).observe(document.body, {
-    childList: true,
-    subtree: true,
-    characterData: true,
-  });
+  setInterval(() => {
+    scanForNewPrompts();
+    checkReply();
+    watchImages();
+  }, 1000);
 
-  setTimeout(report, 1500);
+  // Don't lose a prompt if the tab is closed mid-reply.
+  window.addEventListener("pagehide", finishPending);
+
+  console.debug(`[Evergreen] tracking ${SITE}`);
 })();
